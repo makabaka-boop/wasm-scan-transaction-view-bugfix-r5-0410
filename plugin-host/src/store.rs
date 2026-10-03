@@ -5,7 +5,7 @@
 //! 否则整体撤销（乐观并发控制）。
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::Mutex;
 
@@ -99,28 +99,28 @@ impl KvStore {
         .optional()
     }
 
-    pub fn scan_values(
-        &self,
-        tenant: &str,
-        prefix: &str,
-    ) -> rusqlite::Result<HashMap<String, Vec<u8>>> {
+    /// 任务开始时的一致性快照：在同一把锁下读取当前修订号与全部已提交
+    /// 数据，二者保证对应同一版本。返回的是拷贝，之后其他任务的并发提交
+    /// 不影响它；按键排序（UTF-8 字节序）返回，供 scan 直接枚举。
+    pub fn snapshot(&self, tenant: &str) -> rusqlite::Result<(i64, BTreeMap<String, Vec<u8>>)> {
         let conn = self.conn.lock().unwrap();
-        let mut q = conn.prepare("SELECT key,value FROM kv WHERE tenant=?1 ORDER BY key")?;
-        let mut values = HashMap::new();
-        for row in q.query_map([tenant], |r| {
+        let revision = conn
+            .query_row(
+                "SELECT rev FROM tenant_rev WHERE tenant = ?1",
+                [tenant],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        let mut stmt = conn.prepare("SELECT key, value FROM kv WHERE tenant = ?1 ORDER BY key")?;
+        let mut data = BTreeMap::new();
+        for row in stmt.query_map([tenant], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
         })? {
             let (key, value) = row?;
-            if key.starts_with(prefix) {
-                values.insert(key, value);
-            }
+            data.insert(key, value);
         }
-        Ok(values)
-    }
-
-    pub fn snapshot(&self, tenant: &str) -> rusqlite::Result<(i64, HashMap<String, Vec<u8>>)> {
-        let revision = self.baseline(tenant)?;
-        Ok((revision, self.scan_values(tenant, "")?))
+        Ok((revision, data))
     }
 
     /// 测试/预置辅助：绕过暂存直接写入（不改动修订号）。

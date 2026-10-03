@@ -142,8 +142,9 @@ impl PluginService {
     /// 执行一个任务。
     ///
     /// 每次执行都使用独立的 `Store` 与实例；链接器只提供受许可的
-    /// `env.get` / `env.put` / `env.emit`，不提供任何 WASI 能力。
-    /// 函数返回时实例、线性内存等资源随 `Store` 一起释放。
+    /// `env.get` / `env.put` / `env.emit` / `env.scan`，不提供任何 WASI 能力。
+    /// 任务开始时取基准修订的一致性快照，本次执行的所有读取都对应它并
+    /// 叠加自己的暂存写入；函数返回时实例、线性内存等资源随 `Store` 一起释放。
     pub fn execute(&self, task: &Task) -> RunReport {
         let mut report = RunReport::blank(task);
 
@@ -155,12 +156,13 @@ impl PluginService {
             }
         };
 
-        // 输入基准修订号：提交时据此做乐观并发检查。
-        let baseline = match self.kv.baseline(&task.tenant) {
-            Ok(b) => b,
+        // 输入基准修订号 + 该修订的一致性快照（同一把锁下读取，见 KvStore::snapshot）。
+        // 本次执行的 get/scan 都读这份快照；提交时仍按基准修订号做乐观并发检查。
+        let (baseline, snapshot) = match self.kv.snapshot(&task.tenant) {
+            Ok(s) => s,
             Err(e) => {
                 report.terminal = TerminalState::HostError;
-                report.error = Some(format!("failed to read baseline revision: {e}"));
+                report.error = Some(format!("failed to snapshot baseline revision: {e}"));
                 return report;
             }
         };
@@ -171,6 +173,7 @@ impl PluginService {
             tenant: task.tenant.clone(),
             read_prefixes: task.read_prefixes.clone(),
             write_prefixes: task.write_prefixes.clone(),
+            snapshot,
             staged: HashMap::new(),
             evidence: Vec::new(),
             emitted: Vec::new(),
@@ -182,7 +185,6 @@ impl PluginService {
                 .memories(1)
                 .tables(1)
                 .build(),
-            kv: self.kv.clone(),
             memory: None,
         };
         let mut store = Store::new(&self.engine, ctx);
