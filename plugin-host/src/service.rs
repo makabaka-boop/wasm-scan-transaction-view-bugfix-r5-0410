@@ -142,8 +142,9 @@ impl PluginService {
     /// 执行一个任务。
     ///
     /// 每次执行都使用独立的 `Store` 与实例；链接器只提供受许可的
-    /// `env.get` / `env.put` / `env.emit`，不提供任何 WASI 能力。
-    /// 函数返回时实例、线性内存等资源随 `Store` 一起释放。
+    /// `env.get` / `env.put` / `env.scan` / `env.emit`，不提供任何 WASI 能力。
+    /// 执行开始时原子地取（基准修订号, 已提交数据快照），本次执行的
+    /// 全部读取都基于该快照；函数返回时实例、线性内存等资源随 `Store` 一起释放。
     pub fn execute(&self, task: &Task) -> RunReport {
         let mut report = RunReport::blank(task);
 
@@ -155,12 +156,13 @@ impl PluginService {
             }
         };
 
-        // 输入基准修订号：提交时据此做乐观并发检查。
-        let baseline = match self.kv.baseline(&task.tenant) {
-            Ok(b) => b,
+        // 输入基准修订号 + 该修订对应的已提交数据快照（同一把锁内原子读取）：
+        // 本次执行的 get/scan 都基于这份快照，提交时按基准修订号做乐观并发检查。
+        let (baseline, snapshot) = match self.kv.snapshot(&task.tenant) {
+            Ok(s) => s,
             Err(e) => {
                 report.terminal = TerminalState::HostError;
-                report.error = Some(format!("failed to read baseline revision: {e}"));
+                report.error = Some(format!("failed to snapshot baseline: {e}"));
                 return report;
             }
         };
@@ -171,6 +173,7 @@ impl PluginService {
             tenant: task.tenant.clone(),
             read_prefixes: task.read_prefixes.clone(),
             write_prefixes: task.write_prefixes.clone(),
+            snapshot,
             staged: HashMap::new(),
             evidence: Vec::new(),
             emitted: Vec::new(),
@@ -182,7 +185,6 @@ impl PluginService {
                 .memories(1)
                 .tables(1)
                 .build(),
-            kv: self.kv.clone(),
             memory: None,
         };
         let mut store = Store::new(&self.engine, ctx);
@@ -193,7 +195,7 @@ impl PluginService {
         }
         store.limiter(|c| &mut c.store_limits);
 
-        // 只链接受许可的三个宿主函数；不链接 WASI。
+        // 只链接受许可的四个宿主函数；不链接 WASI。
         // 任何请求其它导入（如 wasi_snapshot_preview1）的模块都会实例化失败。
         let mut linker = Linker::new(&self.engine);
         linker

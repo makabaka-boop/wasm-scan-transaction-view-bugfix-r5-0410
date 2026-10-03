@@ -99,28 +99,28 @@ impl KvStore {
         .optional()
     }
 
-    pub fn scan_values(
-        &self,
-        tenant: &str,
-        prefix: &str,
-    ) -> rusqlite::Result<HashMap<String, Vec<u8>>> {
+    /// 原子快照：同一把锁内读取租户当前修订号与全部已提交键值，
+    /// 保证二者来自同一版本。任务的 `get` / `scan` 都基于这份快照，
+    /// 不会因其他任务中途提交而读到拼接出来的混合版本。
+    pub fn snapshot(&self, tenant: &str) -> rusqlite::Result<(i64, HashMap<String, Vec<u8>>)> {
         let conn = self.conn.lock().unwrap();
-        let mut q = conn.prepare("SELECT key,value FROM kv WHERE tenant=?1 ORDER BY key")?;
+        let revision = conn
+            .query_row(
+                "SELECT rev FROM tenant_rev WHERE tenant = ?1",
+                [tenant],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        let mut q = conn.prepare("SELECT key, value FROM kv WHERE tenant = ?1")?;
         let mut values = HashMap::new();
         for row in q.query_map([tenant], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
         })? {
             let (key, value) = row?;
-            if key.starts_with(prefix) {
-                values.insert(key, value);
-            }
+            values.insert(key, value);
         }
-        Ok(values)
-    }
-
-    pub fn snapshot(&self, tenant: &str) -> rusqlite::Result<(i64, HashMap<String, Vec<u8>>)> {
-        let revision = self.baseline(tenant)?;
-        Ok((revision, self.scan_values(tenant, "")?))
+        Ok((revision, values))
     }
 
     /// 测试/预置辅助：绕过暂存直接写入（不改动修订号）。
